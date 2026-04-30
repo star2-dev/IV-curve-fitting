@@ -1,0 +1,119 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+# ---------- 以下复用前面的核心计算函数 ----------
+def load_iv_data(uploaded_file):
+    """从上传的文件读取电压、电流"""
+    # 支持 csv, txt, 自动识别分隔符
+    try:
+        data = pd.read_csv(uploaded_file, header=None, comment='#')
+    except:
+        st.error("文件读取失败，请确保是纯文本格式（CSV/TXT）")
+        return None, None
+    if data.shape[1] < 2:
+        st.error("数据至少需要两列：电压(V) 和 电流(A)")
+        return None, None
+    voltage = data[0].values
+    current = data[1].values
+    # 如果电流为负，翻转
+    if np.median(current) < 0:
+        current = -current
+    # 按电压排序
+    idx = np.argsort(voltage)
+    voltage, current = voltage[idx], current[idx]
+    return voltage, current
+
+def find_voc(voltage, current):
+    sign_change = np.where(np.diff(np.sign(current)))[0]
+    if len(sign_change) == 0:
+        idx = np.argmin(np.abs(current))
+        return voltage[idx]
+    idx = sign_change[0]
+    v1, v2 = voltage[idx], voltage[idx+1]
+    i1, i2 = current[idx], current[idx+1]
+    return v1 - i1 * (v2 - v1) / (i2 - i1)
+
+def find_isc(voltage, current):
+    sign_change = np.where(np.diff(np.sign(voltage)))[0]
+    if len(sign_change) == 0:
+        idx = np.argmin(np.abs(voltage))
+        return current[idx]
+    idx = sign_change[0]
+    v1, v2 = voltage[idx], voltage[idx+1]
+    i1, i2 = current[idx], current[idx+1]
+    return i1 - v1 * (i2 - i1) / (v2 - v1)
+
+def calculate_max_power(voltage, current):
+    power = voltage * current
+    idx_max = np.argmax(power)
+    return power[idx_max], voltage[idx_max], current[idx_max]
+
+def plot_iv_curve(voltage, current, voc, isc, v_mpp, i_mpp):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    ax1.plot(voltage, current, 'b-', lw=2)
+    ax1.scatter([voc], [0], color='red', label=f'Voc = {voc:.4f} V')
+    ax1.scatter([0], [isc], color='green', label=f'Isc = {isc:.4f} A')
+    ax1.scatter([v_mpp], [i_mpp], color='orange', label=f'MPP ({v_mpp:.3f} V)')
+    ax1.set_xlabel('Voltage (V)'); ax1.set_ylabel('Current (A)')
+    ax1.set_title('I-V Curve'); ax1.legend(); ax1.grid(True, linestyle='--')
+    power = voltage * current
+    ax2.plot(voltage, power, 'r-', lw=2)
+    ax2.scatter([v_mpp], [np.max(power)], color='orange', label=f'Pmax = {np.max(power):.4f} W')
+    ax2.set_xlabel('Voltage (V)'); ax2.set_ylabel('Power (W)')
+    ax2.set_title('P-V Curve'); ax2.legend(); ax2.grid(True, linestyle='--')
+    plt.tight_layout()
+    return fig
+
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="光伏IV曲线分析器", layout="centered")
+st.title("☀️ 太阳能电池 IV 数据分析")
+st.markdown("上传 I-V 数据文件（两列：电压 V，电流 A），自动计算：**Voc, Isc, Pmax, FF, 效率**")
+
+# 侧边栏参数
+st.sidebar.header("测试条件")
+irradiance = st.sidebar.number_input("光照强度 (W/m²)", value=1000.0, step=50.0)
+area_cm2 = st.sidebar.number_input("电池面积 (cm²)", value=1.0, step=0.1, format="%.2f")
+area_m2 = area_cm2 * 1e-4
+
+uploaded_file = st.file_uploader("选择 IV 数据文件 (.csv, .txt)", type=["csv", "txt"])
+
+if uploaded_file is not None:
+    voltage, current = load_iv_data(uploaded_file)
+    if voltage is None:
+        st.stop()
+    
+    # 计算
+    voc = find_voc(voltage, current)
+    isc = find_isc(voltage, current)
+    p_max, v_mpp, i_mpp = calculate_max_power(voltage, current)
+    ff = p_max / (voc * isc) if voc * isc != 0 else 0
+    efficiency = p_max / (irradiance * area_m2) * 100
+    
+    # 显示结果卡片
+    col1, col2, col3 = st.columns(3)
+    col1.metric("开路电压 Voc", f"{voc:.4f} V")
+    col1.metric("短路电流 Isc", f"{isc:.4f} A")
+    col2.metric("最大功率 Pmax", f"{p_max:.4f} W")
+    col2.metric("填充因子 FF", f"{ff:.3f} ({ff*100:.1f}%)")
+    col3.metric("光电转换效率 η", f"{efficiency:.2f} %", delta=None)
+    col3.metric("最大功率点电压", f"{v_mpp:.3f} V")
+    
+    # 显示原始数据表格
+    with st.expander("查看原始数据（前20行）"):
+        df = pd.DataFrame({"电压(V)": voltage, "电流(A)": current})
+        st.dataframe(df.head(20))
+    
+    # 绘图
+    st.subheader("I-V 和 P-V 曲线")
+    fig = plot_iv_curve(voltage, current, voc, isc, v_mpp, i_mpp)
+    st.pyplot(fig)
+    
+    # 下载结果
+    result = pd.DataFrame({
+        "参数": ["Voc (V)", "Isc (A)", "Pmax (W)", "Vmpp (V)", "Impp (A)", "FF", "Efficiency (%)"],
+        "数值": [voc, isc, p_max, v_mpp, i_mpp, ff, efficiency]
+    })
+    st.download_button("📥 下载计算结果 (CSV)", result.to_csv(index=False), "iv_results.csv")
